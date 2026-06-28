@@ -59,7 +59,7 @@ FlightRadar24 (every 30s)
 ```bash
 gcloud auth login
 gcloud auth application-default login
-export GCP_PROJECT_ID="orlytab"
+export GCP_PROJECT_ID=""
 ```
 
 ### 2. Enable APIs
@@ -97,15 +97,15 @@ Three terminals:
 
 ```bash
 # Terminal 1 — poller
-export GCP_PROJECT_ID="orlytab"
+export GCP_PROJECT_ID=""
 python src/ingestion/poller.py
 
 # Terminal 2 — consumer
-export GCP_PROJECT_ID="orlytab"
+export GCP_PROJECT_ID=""
 python src/ingestion/consumer.py
 
 # Terminal 3 — dashboard
-export GCP_PROJECT_ID="orlytab"
+export GCP_PROJECT_ID=""
 streamlit run src/dashboard/app.py
 ```
 

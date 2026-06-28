@@ -1,0 +1,10 @@
+# Copy this file: cp terraform.tfvars.example terraform.tfvars
+# Then fill in your values. terraform.tfvars is in .gitignore — never commit it.
+
+project_id   = "your-gcp-project-id"
+region       = "europe-west1"
+environment  = "dev"
+bq_location  = "EU"
+
+# Optional: email for Cloud Monitoring budget alerts
+# alert_email = "your@email.com"
