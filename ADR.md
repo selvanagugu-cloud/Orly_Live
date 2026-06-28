@@ -1,147 +1,234 @@
-# ADR-001 — Real-Time Flight Board: Architecture Decisions
+# ADR — Architecture Decision Records
+
+## Orly Live · Paris Orly Real-Time Flight Board
+
+\---
+
+## ADR-001 — Consumer Python vs Native BigQuery Subscription
 
 **Status:** Accepted  
-**Date:** 2026-06-25  
-**Author:** Nagulan  
-**Context:** Personal project — live arrivals/departures board for Paris Orly Airport
+**Date:** 2026-06-25
 
-\---
+### Context
 
-## Context
-
-I wanted to build a real-time operational dashboard showing live flights at Paris Orly (LFPO),
-similar to what I work with daily at Transavia. The goal was to practice GCP streaming
-infrastructure and demonstrate a production-grade data pipeline for interviews.
-
-Key constraints:
-
-* Must run in a single evening (≤3h setup)
-* Must use GCP stack (BigQuery, Pub/Sub, Terraform) to match Kering's stack
-* Free tier only (no paid subscriptions)
-* Real data, not mocked
-
-\---
-
-## Decision 1 — Data Source: OpenSky Network API
+Pub/Sub has a native BigQuery subscription feature: messages are written directly
+to a BigQuery table with no code. Zero infrastructure, zero process to manage.
 
 ### Options considered
 
 |Option|Pros|Cons|
 |-|-|-|
-|**OpenSky Network API**|Free, real-time, no API key needed, LFPO filter|Rate-limited (10 req/min anonymous)|
-|AviationStack API|Clean REST API, rich data|Paid above 100 req/month|
-|FlightAware API|Very rich, airline logos|Expensive ($$$)|
-|Scraping FlightRadar24|Free data|ToS violation, fragile|
+|BigQuery native subscription|Zero code, zero ops|No transformation layer, strict schema match required|
+|Python consumer|Full control, transformation, state|Extra process to run|
+|Apache Beam on Dataflow|Auto-scaling, exactly-once|Complex, overkill for this volume|
 
-### Decision: OpenSky Network API
+### Decision: Python consumer
 
-OpenSky provides a public REST endpoint (`/api/states/all`) with bounding box filtering.
-For Orly's coordinates (lat 48.7233, lon 2.3794), a ±0.5° bounding box captures all
-approach/departure traffic reliably. No API key needed for polling every 10 seconds.
+Two things ruled out the native subscription entirely.
+
+**Field mapping.** The FlightRadar24 JSON payload is deeply nested:
+
+```json
+{
+  "flight": {
+    "identification": {
+      "number": { "default": "TO4610" }
+    },
+    "airline": {
+      "name": "Transavia",
+      "code": { "icao": "TVF", "iata": "TO" }
+    },
+    "airport": {
+      "origin": {
+        "code": { "iata": "ORY" },
+        "info": { "terminal": "3", "gate": "35" }
+      },
+      "destination": {
+        "code": { "iata": "AGP" }
+      }
+    },
+    "time": {
+      "scheduled": { "departure": 1750834200 },
+      "estimated": { "departure": 1750836600 }
+    },
+    "status": { "text": "Estimated dep 06:10" }
+  }
+}
+```
+
+Extracting `flight.identification.number.default` into a flat `flight\_number`
+column is something I want to do once, in Python, before data hits BigQuery —
+not wrestle with `JSON\_EXTRACT` on every query.
+
+**Status change detection (CDC).** The consumer maintains an in-memory state cache:
+
+```python
+# In-memory state: {flight\_number: {"status": str, "last\_seen": str}}
+state\_cache = {}
+
+def detect\_status\_change(row):
+    flight\_number  = row\["flight\_number"]
+    current\_status = row\["status"]
+    previous       = state\_cache.get(flight\_number)
+
+    if previous and previous\["status"] != current\_status:
+        event = {
+            "event\_id":      str(uuid.uuid4()),
+            "flight\_number": flight\_number,
+            "status\_before": previous\["status"],
+            "status\_after":  current\_status,
+            "event\_type":    classify\_event(current\_status),
+            "event\_time":    row\["snapshot\_time"],
+        }
+        events\_writer.add(event)
+
+    state\_cache\[flight\_number] = {
+        "status":    current\_status,
+        "last\_seen": row\["snapshot\_time"],
+    }
+```
+
+This is Change Data Capture — comparing current state against previous state
+to detect transitions. A native subscription has no mechanism for inter-message
+state. It receives one message, writes one row, and forgets. The Python consumer
+keeps the state machine alive between messages.
+
+### Consequences
+
+* Extra running process to manage
+* State lost on consumer restart — known limitation, acceptable for this use case
+* Production migration path: replace with Dataflow (Apache Beam on GCP),
+which auto-scales and supports stateful processing natively
 
 \---
 
-## Decision 2 — Streaming: Pub/Sub (not Kafka)
+## ADR-002 — Pub/Sub vs Direct BigQuery Write
+
+**Status:** Accepted  
+**Date:** 2026-06-25
+
+### Context
+
+The poller fetches data every 30 seconds. The simplest design writes directly
+to BigQuery from the poller. Why add Pub/Sub in between?
 
 ### Options considered
 
 |Option|Pros|Cons|
 |-|-|-|
-|**Google Pub/Sub**|Fully managed, native GCP, zero ops|7-day retention max|
-|Apache Kafka|Infinite retention, ordering guarantees|Cluster to manage, overkill for this volume|
-|Direct BigQuery streaming|Simple, fewer components|No decoupling, harder to add consumers|
+|Google Pub/Sub|Decoupling, resilience, DLQ, native GCP|Extra component|
+|Direct BigQuery write|Simpler, fewer components|Tight coupling, data loss on BQ downtime|
+|Kafka|Infinite retention, ordering|Cluster to manage, overkill|
 
 ### Decision: Google Pub/Sub
 
-Volume is low (\~30 aircraft in the Orly zone at any time). Pub/Sub gives:
+**Decoupling.** The poller does not know who consumes its data. If tomorrow I want
+to add a Slack alert when a flight is delayed more than 2 hours, I add a second
+consumer — no changes to the poller. With direct writes, the poller is tightly
+coupled to every downstream system.
 
-* **Decoupling**: the poller doesn't know about BigQuery or the dashboard
-* **Resilience**: if BigQuery is briefly unavailable, messages queue in Pub/Sub
-* **GCP native**: integrates directly with BigQuery subscription...
+**Resilience.** If BigQuery is briefly unavailable (quota exceeded, maintenance),
+messages buffer in Pub/Sub for up to 1 hour. With direct writes, 30 seconds of
+data are lost permanently.
 
-**BUT** — BigQuery native subscription requires schema management and is painful for
-JSON payloads that change shape. Instead, I use a **lightweight Python consumer** that
-reads from Pub/Sub and writes to BigQuery with explicit schema mapping. This gives full
-control over transformations before storage.
+The DLQ and retry configuration in Terraform:
+
+```hcl
+resource "google\_pubsub\_subscription" "orly\_flights\_sub" {
+  name  = "orly-flights-sub"
+  topic = google\_pubsub\_topic.orly\_flights.name
+
+  dead\_letter\_policy {
+    dead\_letter\_topic     = google\_pubsub\_topic.orly\_flights\_dlq.id
+    max\_delivery\_attempts = 3
+  }
+
+  retry\_policy {
+    minimum\_backoff = "5s"
+    maximum\_backoff = "60s"
+  }
+
+  # Without this, GCP auto-deletes the subscription after 31 days of inactivity
+  expiration\_policy {
+    ttl = ""
+  }
+}
+```
+
+After 3 failed delivery attempts, the message goes to `orly-flights-dlq`
+rather than disappearing silently. In production, a Cloud Function on the
+DLQ topic would alert on-call.
+
+### Consequences
+
+* One extra GCP component to provision and monitor
+* 7-day max retention — historical data lives in BigQuery, not Pub/Sub
+* Trade-off accepted: no infinite replay (Kafka advantage), but zero ops overhead
 
 \---
 
-## Decision 3 — Storage: BigQuery (not Cloud SQL or Firestore)
+## ADR-003 — Streamlit vs Looker Studio
 
-### Decision: BigQuery
+**Status:** Accepted  
+**Date:** 2026-06-25
 
-* **Partitioned** on `snapshot\_time` (hourly) — keeps query costs minimal
-* **Clustered** on `icao24` and `origin\_country` — fast filtering per airline
-* Enables historical analysis ("how delayed was Air France at 18:00 last Tuesday?")
-* dbt transformations on top for clean Data Products
+### Context
 
-\---
-
-## Decision 4 — Dashboard: Streamlit (not Looker Studio)
+The dashboard needs to reflect live flight data. Two realistic options:
+Looker Studio (native BigQuery connector, zero server) or Streamlit (code,
+but full control over refresh rate).
 
 ### Options considered
 
 |Option|Pros|Cons|
 |-|-|-|
-|**Streamlit**|Real-time refresh, custom UI, airline logos, free|Needs a running server|
-|Looker Studio|Native BigQuery connector, shareable|15min data refresh minimum — useless for real-time|
-|Grafana|Great for time-series|Complex setup, not GCP native|
+|Streamlit|Genuine real-time refresh, custom UI, airline logos|Needs a running server|
+|Looker Studio|Native BQ, shareable, zero server|15 min minimum refresh|
+|Grafana|Good time-series|Heavy setup, not GCP native|
 
 ### Decision: Streamlit
 
-Looker Studio has a **minimum 15-minute refresh** — unacceptable for a live flight board.
-Streamlit allows `st.rerun()` every 10 seconds, queries BigQuery directly, and renders
-airline logos dynamically via `airportsdata` + logo mapping. Perfect for a live demo.
+The dealbreaker for Looker Studio: **hard minimum refresh interval of 15 minutes.**
 
-\---
+A flight board with 15-minute-old data is not a live flight board.
+It is a history report. For an operations team, a 15-minute delay in seeing
+a flight go from "Scheduled" to "Delayed 2 hours" means missed interventions.
 
-## Decision 5 — Infra: Terraform
+Streamlit's `st.rerun()` combined with `@st.cache\_data(ttl=12)` gives
+genuine real-time refresh with minimal BigQuery load:
 
-All GCP resources provisioned as code:
+```python
+@st.cache\_data(ttl=12)   # cache for 12 seconds
+def load\_departures():
+    return get\_bq().query(Q\_DEPARTURES).to\_dataframe()
 
-* BigQuery dataset + 2 tables (raw flights, processed flights)
-* Pub/Sub topic + subscription
-* Service Account with least-privilege IAM roles
+def main():
+    df = load\_departures()   # served from cache on most reruns
+    st.markdown(render\_flight\_table(df), unsafe\_allow\_html=True)
 
-Trade-off accepted: no remote state backend for this personal project (would add GCS bucket
-complexity). In production, remote state in GCS with locking would be mandatory.
-
-\---
-
-## Diagram
-
-```
-OpenSky API (every 10s)
-        │
-   \[Python poller]          ← src/ingestion/poller.py
-        │
-   Pub/Sub topic            ← "orly-flights"
-  (orly-flights)
-        │
-  \[Python consumer]         ← src/ingestion/consumer.py
-        │
-  BigQuery raw              ← paris\_orly.raw\_flights
-  (partitioned + clustered)
-        │
-      \[dbt]                 ← staging → marts
-        │
-  BigQuery marts
-  ┌─────────────────────┐
-  │ mart\_live\_board     │   ← current state per flight
-  │ mart\_airline\_stats  │   ← delay stats per airline
-  └─────────────────────┘
-        │
-  \[Streamlit dashboard]     ← Live board with logos, auto-refresh 10s
+    time.sleep(15)
+    st.rerun()   # full page refresh every 15 seconds
 ```
 
+The 12-second cache means BigQuery is queried at most once per 15-second cycle,
+regardless of how many components render on the page.
+
+### Consequences
+
+* Server process required (acceptable for a personal project)
+* In production: deploy on Cloud Run with auto-scaling
+* Looker Studio remains the right choice for analytical reporting dashboards
+where 15-minute freshness is acceptable
+
 \---
 
-## What I would add in production (Kering-grade)
 
-1. **Remote Terraform state** in GCS with object locking
-2. **Dataflow** instead of Python consumer for auto-scaling
-3. **Airflow DAG** orchestrating the dbt runs every 15 min
-4. **Data quality checks** with dbt tests + Great Expectations
-5. **CI/CD** with GitHub Actions: terraform plan on PR, apply on merge
-6. **Monitoring** with Cloud Monitoring alerts on Pub/Sub message age
+## What I would add for production
+
+1. **Dataflow** — replace Python consumer, auto-scaling, exactly-once semantics
+2. **Remote Terraform state** — GCS backend with object locking
+3. **Airflow DAG** — orchestrate dbt runs every 15 min, alert on freshness SLA
+4. **Cloud Monitoring** — alert on `subscription/oldest\_unacked\_message\_age`
+5. **Authorized Views** — expose mart tables without giving access to raw data
+6. **Redis (Memorystore)** — persist the CDC state cache across consumer restarts
 
